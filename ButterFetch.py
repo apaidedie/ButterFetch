@@ -4,9 +4,6 @@
 """
 ButterFetch - 黄油搜索工具
 支持 DLsite / FANZA / VNDB 三平台并行搜索
-VNDB 嗅探的商店链接会自动整合到对应平台结果中
-
-优化版本 v2.0 - 包含完整的架构优化
 """
 
 import sys
@@ -64,7 +61,7 @@ def setup_logger() -> logging.Logger:
         return _logger
     
     formatter = logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(message)s',
+        '%(asctime)s [%(levelname)s] %(message)s'，
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
@@ -1844,6 +1841,14 @@ class ButterFetchApp(ttk.Window):
         self.title("🧈 ButterFetch 🧈 ")
         self.geometry(config.window_geometry)
         
+        # 图标引用先初始化
+        self._icon_16 = None
+        self._icon_32 = None  
+        self._icon_48 = None
+        
+        # 立即设置一次
+        self._setup_icon()
+        
         # 设置全局异常处理
         GlobalExceptionHandler.setup(self)
         
@@ -1889,6 +1894,8 @@ class ButterFetchApp(ttk.Window):
         self.state_manager.add_observer(self._on_state_change)
         
         logger.info("ButterFetch 启动成功")
+        
+        self.after(50, self._setup_icon)
     
     def _apply_style(self) -> None:
         self.style.colors.warning = Colors.GRAPE
@@ -1902,15 +1909,23 @@ class ButterFetchApp(ttk.Window):
         )
     
     def _setup_icon(self) -> None:
+        """设置窗口图标"""
         icon_path = resource_path("ButterFetch.ico")
         if os.path.exists(icon_path):
             try:
-                self.wm_iconbitmap(default=icon_path)
-                icon_img = Image.open(icon_path).resize((48, 48), Image.Resampling.LANCZOS)
-                self._icon = ImageTk.PhotoImage(icon_img)
-                self.wm_iconphoto(True, self._icon)
+                # 加载图标
+                icon_img = Image.open(icon_path)
+                
+                # 创建多个尺寸并保持引用
+                self._icon_16 = ImageTk.PhotoImage(icon_img.resize((16, 16), Image.Resampling.LANCZOS))
+                self._icon_32 = ImageTk.PhotoImage(icon_img.resize((32, 32), Image.Resampling.LANCZOS))
+                self._icon_48 = ImageTk.PhotoImage(icon_img.resize((48, 48), Image.Resampling.LANCZOS))
+                
+                # 设置图标
+                self.iconphoto(True, self._icon_48, self._icon_32, self._icon_16)
             except Exception as e:
                 logger.warning(f"图标加载失败: {e}")
+
     
     def _build_ui(self) -> None:
         # 工具栏
