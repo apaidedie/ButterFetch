@@ -37,13 +37,13 @@
 <summary>点击展开截图</summary>
 
 ### 主界面
-![主界面](screenshots/main.png)
+![主界面](main.png)
 
 ### 搜索结果
-![搜索结果](screenshots/search.png)
+![搜索结果](search.png)
 
 ### 深色模式
-![深色模式](screenshots/dark_mode.png)
+![深色模式](dark_mode.png)
 
 </details>
 
