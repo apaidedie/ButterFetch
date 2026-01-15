@@ -2,7 +2,7 @@
 <p align="center">
   <img src="ButterFetch.ico" alt="ButterFetch Logo" width="128" height="128" />
 </p>
-# 🧈 ButterFetch
+ 🧈 ButterFetch
 
 **一款黄油(Galgame)搜索工具**
 
