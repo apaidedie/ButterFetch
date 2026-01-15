@@ -4,14 +4,14 @@
 </p>
 # 🧈 ButterFetch
 
-**一款可爱的黄油(Galgame)搜索工具**
+**一款黄油(Galgame)搜索工具**
 
 支持 DLsite / FANZA / VNDB 三平台并行搜索
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)]()
-[![Release](https://img.shields.io/github/v/release/你的用户名/ButterFetch?color=orange)](https://github.com/你的用户名/ButterFetch/releases)
+[![Release](https://img.shields.io/github/v/release/apaidedie/ButterFetch?color=orange)](https://github.com/apaidedie/ButterFetch/releases)
 
 [下载](#-下载) • [功能](#-功能特性) • [截图](#-截图) • [使用](#-使用说明) • [构建](#-从源码构建)
 
@@ -51,7 +51,7 @@
 
 ### 直接下载
 
-前往 [Releases](https://github.com/你的用户名/ButterFetch/releases) 页面下载最新版本的 `ButterFetch.exe`
+前往 [Releases](https://github.com/apaidedie/ButterFetch/releases) 页面下载最新版本的 `ButterFetch.exe`
 
 ### 系统要求
 
