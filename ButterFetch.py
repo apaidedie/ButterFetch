@@ -4,7 +4,6 @@
 """
 ButterFetch - 黄油搜索工具
 支持 DLsite / FANZA / VNDB 三平台并行搜索
-带智能分词降级搜索和相关性评分排序
 """
 
 import sys
