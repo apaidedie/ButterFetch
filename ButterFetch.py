@@ -4,6 +4,7 @@
 """
 ButterFetch - 黄油搜索工具
 支持 DLsite / FANZA / VNDB 三平台并行搜索
+带智能分词降级搜索和相关性评分排序
 """
 
 import sys
@@ -61,7 +62,7 @@ def setup_logger() -> logging.Logger:
         return _logger
     
     formatter = logging.Formatter(
-        '%(asctime)s [%(levelname)s] %(message)s'，
+        '%(asctime)s [%(levelname)s] %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
@@ -294,6 +295,10 @@ class Patterns:
     VNDB_SNIFF_DMM = re.compile(r'(?:cid=|/detail/)([a-z0-9_]+?)(?:/|$|\?)', re.IGNORECASE)
     OG_IMAGE = re.compile(r'<meta property="og:image" content="(.*?)"')
     GEOMETRY = re.compile(r'^\d+x\d+(\+\d+\+\d+)?$')
+    
+    # ID 匹配模式
+    DLSITE_ID = re.compile(r'^[RVrv][Jj]\d{6,8}$')
+    FANZA_ID_EXACT = re.compile(r'^[a-z]{1,5}_?\d{3,6}[a-z]?$', re.IGNORECASE)
     
     NON_GAME_PATTERNS = [
         re.compile(r'_ost$', re.IGNORECASE),
@@ -759,6 +764,7 @@ class SearchResult:
     url: str
     thumb_url: str = ""
     from_vndb: bool = False
+    relevance_score: float = 0.0  # 相关性评分
 
 
 @dataclass
@@ -822,6 +828,262 @@ class Shortcut:
     callback: Callable
 
 
+@dataclass
+class ScoredResult:
+    """带评分的搜索结果"""
+    result: SearchResult
+    score: float
+    
+    def __lt__(self, other: 'ScoredResult') -> bool:
+        return self.score > other.score  # 降序排列
+
+
+# ============================================================================
+# 相关性评分系统
+# ============================================================================
+
+class RelevanceScorer:
+    """相关性评分器 - 计算搜索结果与关键词的匹配度"""
+    
+    # 日文停用词（计算时忽略）
+    STOPWORDS = set([
+        'の', 'と', 'に', 'で', 'を', 'は', 'が', 'へ', 'や', 'も',
+        'な', 'だ', 'です', 'ます', 'する', 'した', 'して', 'される',
+        'the', 'a', 'an', 'of', 'to', 'in', 'for', 'on', 'with'
+    ])
+    
+    # 标题分隔符
+    SEPARATORS = re.compile(r'[～~\-—｜|／/《》「」『』【】\[\]()（）]')
+    
+    # 特殊字符清理
+    SPECIAL_CHARS = re.compile(r'[○×★☆◆◇■□▲△▼▽♀♂♪♡♥！!？?…．.、，,：:；;""''\s]')
+    
+    # 数字和版本标记
+    VERSION_PATTERN = re.compile(r'(?:ver\.?|v\.?|第)?[\d.]+(?:版|話|章|巻)?', re.IGNORECASE)
+    
+    @classmethod
+    def calculate_score(cls, keyword: str, result_title: str) -> float:
+        """
+        计算关键词与结果标题的相关性得分
+        
+        返回: 0.0 ~ 1.0 的得分，越高越相关
+        """
+        if not keyword or not result_title:
+            return 0.0
+        
+        # 预处理
+        kw_normalized = cls._normalize(keyword)
+        title_normalized = cls._normalize(result_title)
+        
+        if not kw_normalized or not title_normalized:
+            return 0.0
+        
+        # 计算多个维度的得分
+        scores = {
+            'exact_match': cls._exact_match_score(kw_normalized, title_normalized),
+            'substring': cls._substring_score(kw_normalized, title_normalized),
+            'token_overlap': cls._token_overlap_score(kw_normalized, title_normalized),
+            'char_overlap': cls._char_overlap_score(kw_normalized, title_normalized),
+            'prefix_match': cls._prefix_match_score(kw_normalized, title_normalized),
+            'core_match': cls._core_keyword_score(keyword, result_title),
+        }
+        
+        # 加权平均
+        weights = {
+            'exact_match': 0.30,
+            'substring': 0.25,
+            'token_overlap': 0.20,
+            'char_overlap': 0.10,
+            'prefix_match': 0.10,
+            'core_match': 0.05,
+        }
+        
+        final_score = sum(scores[k] * weights[k] for k in scores)
+        
+        # 长度惩罚：结果标题过长时轻微降分
+        length_ratio = len(kw_normalized) / max(len(title_normalized), 1)
+        if length_ratio < 0.3:
+            final_score *= 0.9
+        
+        return min(1.0, max(0.0, final_score))
+    
+    @classmethod
+    def _normalize(cls, text: str) -> str:
+        """标准化文本"""
+        text = text.lower()
+        text = cls._fullwidth_to_halfwidth(text)
+        text = cls.SPECIAL_CHARS.sub('', text)
+        text = cls.VERSION_PATTERN.sub('', text)
+        text = ' '.join(text.split())
+        return text.strip()
+    
+    @classmethod
+    def _fullwidth_to_halfwidth(cls, text: str) -> str:
+        """全角字符转半角"""
+        result = []
+        for char in text:
+            code = ord(char)
+            if 0xFF01 <= code <= 0xFF5E:
+                result.append(chr(code - 0xFEE0))
+            elif code == 0x3000:
+                result.append(' ')
+            else:
+                result.append(char)
+        return ''.join(result)
+    
+    @classmethod
+    def _tokenize(cls, text: str) -> List[str]:
+        """分词"""
+        parts = cls.SEPARATORS.split(text)
+        tokens = []
+        for part in parts:
+            words = part.split()
+            for word in words:
+                word = word.strip()
+                if word and word not in cls.STOPWORDS and len(word) >= 2:
+                    tokens.append(word)
+        return tokens
+    
+    @classmethod
+    def _exact_match_score(cls, kw: str, title: str) -> float:
+        """完全匹配得分"""
+        if kw == title:
+            return 1.0
+        if kw.replace(' ', '') == title.replace(' ', ''):
+            return 0.95
+        return 0.0
+    
+    @classmethod
+    def _substring_score(cls, kw: str, title: str) -> float:
+        """子串包含得分"""
+        kw_clean = kw.replace(' ', '')
+        title_clean = title.replace(' ', '')
+        
+        if kw_clean in title_clean:
+            ratio = len(kw_clean) / len(title_clean)
+            return 0.7 + 0.3 * ratio
+        
+        if title_clean in kw_clean:
+            ratio = len(title_clean) / len(kw_clean)
+            return 0.5 + 0.3 * ratio
+        
+        return 0.0
+    
+    @classmethod
+    def _token_overlap_score(cls, kw: str, title: str) -> float:
+        """词汇重叠得分"""
+        kw_tokens = set(cls._tokenize(kw))
+        title_tokens = set(cls._tokenize(title))
+        
+        if not kw_tokens or not title_tokens:
+            return 0.0
+        
+        intersection = kw_tokens & title_tokens
+        union = kw_tokens | title_tokens
+        
+        if not union:
+            return 0.0
+        
+        jaccard = len(intersection) / len(union)
+        kw_coverage = len(intersection) / len(kw_tokens) if kw_tokens else 0
+        
+        return 0.6 * jaccard + 0.4 * kw_coverage
+    
+    @classmethod
+    def _char_overlap_score(cls, kw: str, title: str) -> float:
+        """字符级别重叠得分"""
+        kw_chars = set(kw.replace(' ', ''))
+        title_chars = set(title.replace(' ', ''))
+        
+        if not kw_chars:
+            return 0.0
+        
+        overlap = kw_chars & title_chars
+        coverage = len(overlap) / len(kw_chars)
+        
+        return coverage
+    
+    @classmethod
+    def _prefix_match_score(cls, kw: str, title: str) -> float:
+        """前缀匹配得分"""
+        kw_clean = kw.replace(' ', '')
+        title_clean = title.replace(' ', '')
+        
+        common_len = 0
+        for c1, c2 in zip(kw_clean, title_clean):
+            if c1 == c2:
+                common_len += 1
+            else:
+                break
+        
+        if common_len == 0:
+            return 0.0
+        
+        return common_len / len(kw_clean)
+    
+    @classmethod
+    def _core_keyword_score(cls, original_kw: str, original_title: str) -> float:
+        """核心关键词匹配"""
+        kw_parts = cls.SEPARATORS.split(original_kw)
+        title_parts = cls.SEPARATORS.split(original_title)
+        
+        if not kw_parts or not title_parts:
+            return 0.0
+        
+        kw_main = cls._normalize(kw_parts[0])
+        title_main = cls._normalize(title_parts[0])
+        
+        if not kw_main or not title_main:
+            return 0.0
+        
+        if kw_main == title_main:
+            return 1.0
+        if kw_main in title_main or title_main in kw_main:
+            return 0.7
+        
+        return cls._char_overlap_score(kw_main, title_main) * 0.5
+
+
+class ResultSorter:
+    """结果排序器"""
+    
+    @staticmethod
+    def sort_by_relevance(
+        keyword: str, 
+        results: List[SearchResult],
+        min_score: float = 0.0
+    ) -> List[SearchResult]:
+        """按相关性排序结果"""
+        if not results:
+            return []
+        
+        scored_results: List[ScoredResult] = []
+        
+        for result in results:
+            score = RelevanceScorer.calculate_score(keyword, result.title)
+            
+            # VNDB嗅探来的结果给予小幅加分
+            if result.from_vndb:
+                score = min(1.0, score + 0.1)
+            
+            result.relevance_score = score
+            
+            if score >= min_score:
+                scored_results.append(ScoredResult(result, score))
+                logger.debug(f"[评分] {result.title[:25]}... → {score:.3f}")
+        
+        scored_results.sort()
+        
+        return [sr.result for sr in scored_results]
+    
+    @staticmethod
+    def sort_grouped_results(keyword: str, grouped: GroupedResults) -> GroupedResults:
+        """对分组结果进行排序"""
+        grouped.dlsite = ResultSorter.sort_by_relevance(keyword, grouped.dlsite)
+        grouped.fanza = ResultSorter.sort_by_relevance(keyword, grouped.fanza)
+        return grouped
+
+
 # ============================================================================
 # 搜索提供者接口
 # ============================================================================
@@ -861,207 +1123,8 @@ def safe_search(source: SearchSource):
 
 
 # ============================================================================
-# 搜索实现
+# ID 获取函数
 # ============================================================================
-
-class VNDBSearchProvider(ISearchProvider):
-    """VNDB 搜索提供者"""
-    
-    @property
-    def source(self) -> SearchSource:
-        return SearchSource.VNDB
-    
-    @safe_search(SearchSource.VNDB)
-    def search(self, keyword: str) -> List[SearchResult]:
-        results = []
-        
-        payload = {
-            "filters": ["search", "=", keyword],
-            "fields": "id, title, titles.title, titles.lang, image.url",
-            "results": Limits.MAX_RESULTS
-        }
-        
-        resp = network.post(APIEndpoints.VNDB_API, headers=Headers.VNDB, json=payload)
-        data = resp.json()
-        
-        for item in data.get('results', []):
-            gid = item.get('id', '')
-            
-            final_title = item.get('title', 'Unknown')
-            for t_obj in item.get('titles', []):
-                if t_obj.get('lang') == 'ja' and t_obj.get('title'):
-                    final_title = t_obj['title']
-                    break
-            
-            img_obj = item.get('image')
-            thumb_url = img_obj.get('url', '') if img_obj else ""
-            
-            results.append(SearchResult(
-                source=SearchSource.VNDB,
-                id=gid,
-                title=final_title,
-                url=f"https://vndb.org/{gid}",
-                thumb_url=thumb_url
-            ))
-        
-        logger.info(f"[VNDB] 找到 {len(results)} 个结果")
-        return results
-
-
-class DLsiteSearchProvider(ISearchProvider):
-    """DLsite 搜索提供者"""
-    
-    @property
-    def source(self) -> SearchSource:
-        return SearchSource.DLSITE
-    
-    @safe_search(SearchSource.DLSITE)
-    def search(self, keyword: str) -> List[SearchResult]:
-        keywords = list(dict.fromkeys([
-            keyword,
-            Patterns.DLSITE_CLEAN.sub('', keyword)
-        ]))
-        
-        results: List[SearchResult] = []
-        seen: Set[str] = set()
-        
-        for kw in keywords[:2]:
-            if len(results) >= Limits.MAX_RESULTS:
-                break
-            
-            for mode in APIEndpoints.DLSITE_MODES:
-                if len(results) >= Limits.MAX_RESULTS:
-                    break
-                
-                url = APIEndpoints.dlsite_search(mode, kw)
-                resp = network.get(url, cookies=Cookies.DLSITE)
-                
-                for link, gid in Patterns.DLSITE_LINK.findall(resp.text):
-                    if gid in seen:
-                        continue
-                    
-                    title_match = re.search(
-                        f'product_id/{gid}.*?title="(.*?)"',
-                        resp.text,
-                        re.S
-                    )
-                    title = title_match.group(1).replace('"', '').strip() if title_match else gid
-                    
-                    results.append(SearchResult(
-                        source=SearchSource.DLSITE,
-                        id=gid,
-                        title=title,
-                        url=link
-                    ))
-                    seen.add(gid)
-                    
-                    if len(results) >= Limits.MAX_RESULTS:
-                        break
-        
-        logger.info(f"[DLsite] 找到 {len(results)} 个结果")
-        return results
-
-
-class FanzaSearchProvider(ISearchProvider):
-    """FANZA 搜索提供者"""
-    
-    @property
-    def source(self) -> SearchSource:
-        return SearchSource.FANZA
-    
-    @safe_search(SearchSource.FANZA)
-    def search(self, keyword: str) -> List[SearchResult]:
-        results: List[SearchResult] = []
-        
-        url = APIEndpoints.fanza_search(keyword)
-        resp = network.get(url, cookies=Cookies.FANZA)
-        
-        soup = BeautifulSoup(resp.content, 'html.parser')
-        
-        items = soup.select('li.tmb-list-item, div.t-item')
-        if items:
-            links = [item.find('a', href=Patterns.FANZA_ID) for item in items]
-        else:
-            links = soup.find_all('a', href=Patterns.FANZA_ID)
-        
-        seen: Set[str] = set()
-        
-        for link in links:
-            if not link:
-                continue
-            
-            match = Patterns.FANZA_ID.search(link.get('href', ''))
-            if not match:
-                continue
-            
-            gid = match.group(1)
-            raw_title = link.get_text(strip=True)
-            
-            if not raw_title or gid in seen:
-                continue
-            
-            title = Patterns.FANZA_PREFIX.sub('', raw_title).strip() or raw_title
-            
-            thumb = ""
-            img_tag = link.find_previous('img')
-            if img_tag:
-                thumb = img_tag.get('src', '')
-            
-            results.append(SearchResult(
-                source=SearchSource.FANZA,
-                id=gid,
-                title=title,
-                url=APIEndpoints.fanza_detail(gid),
-                thumb_url=thumb
-            ))
-            seen.add(gid)
-            
-            if len(results) >= Limits.MAX_RESULTS:
-                break
-        
-        logger.info(f"[FANZA] 找到 {len(results)} 个结果")
-        return results
-
-
-# ============================================================================
-# VNDB 嗅探与 ID 获取
-# ============================================================================
-
-def sniff_shop_ids_from_vndb(vndb_results: List[SearchResult]) -> SniffedShopInfo:
-    """从 VNDB 结果页面嗅探所有商店 ID"""
-    sniffed = SniffedShopInfo()
-    dlsite_seen: Set[str] = set()
-    fanza_seen: Set[str] = set()
-    
-    for result in vndb_results:
-        try:
-            resp = network.get(result.url)
-            soup = BeautifulSoup(resp.content, 'html.parser')
-            
-            for anchor in soup.find_all('a', href=True):
-                href = anchor['href']
-                
-                if 'dlsite.com' in href:
-                    for match in Patterns.VNDB_SNIFF_DLSITE.finditer(href):
-                        gid = match.group(1).upper()
-                        if gid not in dlsite_seen:
-                            sniffed.dlsite_ids.append(gid)
-                            dlsite_seen.add(gid)
-                
-                elif 'dmm.co.jp' in href and '/detail/' in href:
-                    match = Patterns.VNDB_SNIFF_DMM.search(href)
-                    if match:
-                        gid = match.group(1)
-                        if gid not in fanza_seen and not Patterns.is_non_game_id(gid):
-                            sniffed.fanza_ids.append(gid)
-                            fanza_seen.add(gid)
-        
-        except Exception as e:
-            logger.warning(f"[VNDB嗅探] 解析 {result.id} 失败: {e}")
-    
-    logger.info(f"[VNDB嗅探] DLsite: {len(sniffed.dlsite_ids)}个, FANZA: {len(sniffed.fanza_ids)}个")
-    return sniffed
-
 
 def fetch_dlsite_info_by_id(gid: str) -> Optional[SearchResult]:
     """通过 ID 获取 DLsite 游戏信息"""
@@ -1140,7 +1203,7 @@ def fetch_fanza_info_by_id(gid: str) -> Optional[SearchResult]:
                     from_vndb=True
                 )
         
-        logger.warning(f"[FANZA] {gid} 无法解析标题，使用ID作为标题")
+        logger.warning(f"[FANZA] {gid} 无法解析标题")
         return SearchResult(
             source=SearchSource.FANZA,
             id=gid,
@@ -1152,6 +1215,368 @@ def fetch_fanza_info_by_id(gid: str) -> Optional[SearchResult]:
     except Exception as e:
         logger.warning(f"[FANZA] 获取 {gid} 信息失败: {e}")
     return None
+
+
+# ============================================================================
+# 搜索实现
+# ============================================================================
+
+class VNDBSearchProvider(ISearchProvider):
+    """VNDB 搜索提供者"""
+    
+    @property
+    def source(self) -> SearchSource:
+        return SearchSource.VNDB
+    
+    @safe_search(SearchSource.VNDB)
+    def search(self, keyword: str) -> List[SearchResult]:
+        results = []
+        
+        payload = {
+            "filters": ["search", "=", keyword],
+            "fields": "id, title, titles.title, titles.lang, image.url",
+            "results": Limits.MAX_RESULTS
+        }
+        
+        resp = network.post(APIEndpoints.VNDB_API, headers=Headers.VNDB, json=payload)
+        data = resp.json()
+        
+        for item in data.get('results', []):
+            gid = item.get('id', '')
+            
+            final_title = item.get('title', 'Unknown')
+            for t_obj in item.get('titles', []):
+                if t_obj.get('lang') == 'ja' and t_obj.get('title'):
+                    final_title = t_obj['title']
+                    break
+            
+            img_obj = item.get('image')
+            thumb_url = img_obj.get('url', '') if img_obj else ""
+            
+            results.append(SearchResult(
+                source=SearchSource.VNDB,
+                id=gid,
+                title=final_title,
+                url=f"https://vndb.org/{gid}",
+                thumb_url=thumb_url
+            ))
+        
+        logger.info(f"[VNDB] 找到 {len(results)} 个结果")
+        return results
+
+
+class DLsiteSearchProvider(ISearchProvider):
+    """DLsite 搜索提供者 - 带智能分词和相关性排序"""
+    
+    # 标题分隔符
+    TITLE_SEPARATORS = re.compile(r'[～~\-—｜|／/《》「」『』【】\[\]()（）]')
+    
+    # 特殊字符清理
+    SPECIAL_CHARS = re.compile(r'[○×★☆◆◇■□▲△▼▽♀♂♪♡♥！!？?…．.、，,：:；;（）\(\)「」『』【】\[\]《》〈〉""''\s]')
+    
+    def __init__(self):
+        self._current_keyword: str = ""
+    
+    @property
+    def source(self) -> SearchSource:
+        return SearchSource.DLSITE
+    
+    @safe_search(SearchSource.DLSITE)
+    def search(self, keyword: str) -> List[SearchResult]:
+        self._current_keyword = keyword
+        clean_keyword = keyword.strip()
+        
+        # ===== 1. 精确 ID 检测 =====
+        if Patterns.DLSITE_ID.match(clean_keyword.upper()):
+            gid = clean_keyword.upper()
+            result = fetch_dlsite_info_by_id(gid)
+            if result:
+                result.from_vndb = False  # 直接ID搜索不是VNDB嗅探
+                logger.info(f"[DLsite] 精确匹配ID: {gid}")
+                return [result]
+            logger.warning(f"[DLsite] ID {gid} 未找到，尝试关键词搜索")
+        
+        # ===== 2. 生成搜索候选词 =====
+        search_candidates = self._generate_search_candidates(clean_keyword)
+        
+        # ===== 3. 渐进式搜索 =====
+        results: List[SearchResult] = []
+        seen_ids: Set[str] = set()
+        tried_keywords: Set[str] = set()
+        
+        for candidate in search_candidates:
+            if len(results) >= Limits.MAX_RESULTS * 2:
+                break
+            
+            if candidate in tried_keywords or len(candidate) < 2:
+                continue
+            tried_keywords.add(candidate)
+            
+            new_results = self._search_keyword(candidate, seen_ids)
+            
+            if new_results:
+                results.extend(new_results)
+                logger.info(f"[DLsite] 「{candidate[:20]}」找到 {len(new_results)} 个")
+                
+                # 完整标题搜到足够结果就停止
+                if len(results) >= Limits.MAX_RESULTS and candidate == search_candidates[0]:
+                    break
+        
+        # ===== 4. 相关性排序 =====
+        if results:
+            results = ResultSorter.sort_by_relevance(
+                keyword, 
+                results, 
+                min_score=0.1
+            )
+            logger.info(f"[DLsite] 排序后保留 {len(results)} 个结果")
+        
+        return results[:Limits.MAX_RESULTS]
+    
+    def _generate_search_candidates(self, keyword: str) -> List[str]:
+        """生成搜索候选词列表（按优先级排序）"""
+        candidates = []
+        
+        # Level 1: 完整标题
+        cleaned_full = self._clean_for_search(keyword)
+        if cleaned_full:
+            candidates.append(cleaned_full)
+        
+        basic_clean = Patterns.DLSITE_CLEAN.sub('', keyword).strip()
+        if basic_clean and basic_clean != cleaned_full:
+            candidates.append(basic_clean)
+        
+        # Level 2: 按分隔符拆分
+        parts = self.TITLE_SEPARATORS.split(keyword)
+        parts = [self._clean_for_search(p) for p in parts if p.strip()]
+        parts = [p for p in parts if p and len(p) >= 2]
+        parts_sorted = sorted(set(parts), key=len, reverse=True)
+        
+        for part in parts_sorted:
+            if part not in candidates:
+                candidates.append(part)
+        
+        # Level 3: 长部分切片 (6字符一组)
+        CHUNK_SIZE = 6
+        for part in parts_sorted:
+            if len(part) > CHUNK_SIZE * 1.5:
+                chunks = self._split_into_chunks(part, CHUNK_SIZE)
+                for chunk in chunks:
+                    if chunk not in candidates and len(chunk) >= 4:
+                        candidates.append(chunk)
+        
+        # Level 4: 核心词提取
+        core_keywords = self._extract_core_keywords(keyword)
+        for core in core_keywords:
+            if core not in candidates:
+                candidates.append(core)
+        
+        logger.debug(f"[DLsite] 生成 {len(candidates)} 个搜索候选")
+        return candidates
+    
+    def _clean_for_search(self, text: str) -> str:
+        """清理文本用于搜索"""
+        cleaned = self.SPECIAL_CHARS.sub('', text)
+        cleaned = ' '.join(cleaned.split())
+        return cleaned.strip()
+    
+    def _split_into_chunks(self, text: str, chunk_size: int) -> List[str]:
+        """将长文本按固定长度切片"""
+        chunks = []
+        for i in range(0, len(text), chunk_size):
+            chunk = text[i:i + chunk_size]
+            if len(chunk) >= chunk_size * 0.6:
+                chunks.append(chunk)
+        return chunks
+    
+    def _extract_core_keywords(self, keyword: str) -> List[str]:
+        """提取核心关键词"""
+        cores = []
+        patterns_to_remove = [
+            r'[～~][^～~]+$',
+            r'[-—][^-—]+$',
+            r'[\[\]【】][^\[\]【】]+$',
+            r'第?\d+[話话章巻].*$',
+            r'(?:完全|完結|豪華|限定|特別)版?$',
+        ]
+        
+        text = keyword
+        for pattern in patterns_to_remove:
+            cleaned = re.sub(pattern, '', text).strip()
+            if cleaned and len(cleaned) >= 4 and cleaned != text:
+                cleaned = self._clean_for_search(cleaned)
+                if cleaned:
+                    cores.append(cleaned)
+        return cores
+    
+    def _search_keyword(self, keyword: str, seen_ids: Set[str]) -> List[SearchResult]:
+        """执行单个关键词的搜索"""
+        results = []
+        
+        for mode in APIEndpoints.DLSITE_MODES:
+            if len(results) >= 5:
+                break
+            
+            try:
+                url = APIEndpoints.dlsite_search(mode, keyword)
+                resp = network.get(url, cookies=Cookies.DLSITE)
+                
+                for link, gid in Patterns.DLSITE_LINK.findall(resp.text):
+                    if gid in seen_ids:
+                        continue
+                    
+                    title_match = re.search(
+                        f'product_id/{gid}.*?title="(.*?)"',
+                        resp.text,
+                        re.S
+                    )
+                    title = title_match.group(1).replace('"', '').strip() if title_match else gid
+                    
+                    results.append(SearchResult(
+                        source=SearchSource.DLSITE,
+                        id=gid,
+                        title=title,
+                        url=link
+                    ))
+                    seen_ids.add(gid)
+                    
+            except Exception as e:
+                logger.warning(f"[DLsite] 搜索「{keyword[:15]}」失败: {e}")
+                continue
+        
+        return results
+
+
+class FanzaSearchProvider(ISearchProvider):
+    """FANZA 搜索提供者 - 带相关性排序"""
+    
+    def __init__(self):
+        self._current_keyword: str = ""
+    
+    @property
+    def source(self) -> SearchSource:
+        return SearchSource.FANZA
+    
+    @safe_search(SearchSource.FANZA)
+    def search(self, keyword: str) -> List[SearchResult]:
+        self._current_keyword = keyword
+        clean_keyword = keyword.strip()
+        
+        # 精确 ID 检测
+        if Patterns.FANZA_ID_EXACT.match(clean_keyword.lower()):
+            result = fetch_fanza_info_by_id(clean_keyword.lower())
+            if result:
+                result.from_vndb = False
+                logger.info(f"[FANZA] 精确匹配ID: {clean_keyword}")
+                return [result]
+            logger.warning(f"[FANZA] ID {clean_keyword} 未找到，尝试搜索")
+        
+        # 执行搜索
+        results = self._do_search(keyword)
+        
+        # 相关性排序
+        if results:
+            results = ResultSorter.sort_by_relevance(
+                keyword,
+                results,
+                min_score=0.1
+            )
+            logger.info(f"[FANZA] 排序后保留 {len(results)} 个结果")
+        
+        return results[:Limits.MAX_RESULTS]
+    
+    def _do_search(self, keyword: str) -> List[SearchResult]:
+        """执行搜索"""
+        results: List[SearchResult] = []
+        
+        url = APIEndpoints.fanza_search(keyword)
+        resp = network.get(url, cookies=Cookies.FANZA)
+        
+        soup = BeautifulSoup(resp.content, 'html.parser')
+        
+        items = soup.select('li.tmb-list-item, div.t-item')
+        if items:
+            links = [item.find('a', href=Patterns.FANZA_ID) for item in items]
+        else:
+            links = soup.find_all('a', href=Patterns.FANZA_ID)
+        
+        seen: Set[str] = set()
+        
+        for link in links:
+            if not link:
+                continue
+            
+            match = Patterns.FANZA_ID.search(link.get('href', ''))
+            if not match:
+                continue
+            
+            gid = match.group(1)
+            raw_title = link.get_text(strip=True)
+            
+            if not raw_title or gid in seen:
+                continue
+            
+            title = Patterns.FANZA_PREFIX.sub('', raw_title).strip() or raw_title
+            
+            thumb = ""
+            img_tag = link.find_previous('img')
+            if img_tag:
+                thumb = img_tag.get('src', '')
+            
+            results.append(SearchResult(
+                source=SearchSource.FANZA,
+                id=gid,
+                title=title,
+                url=APIEndpoints.fanza_detail(gid),
+                thumb_url=thumb
+            ))
+            seen.add(gid)
+            
+            if len(results) >= Limits.MAX_RESULTS * 2:
+                break
+        
+        logger.info(f"[FANZA] 原始找到 {len(results)} 个结果")
+        return results
+
+
+# ============================================================================
+# VNDB 嗅探
+# ============================================================================
+
+def sniff_shop_ids_from_vndb(vndb_results: List[SearchResult]) -> SniffedShopInfo:
+    """从 VNDB 结果页面嗅探所有商店 ID"""
+    sniffed = SniffedShopInfo()
+    dlsite_seen: Set[str] = set()
+    fanza_seen: Set[str] = set()
+    
+    for result in vndb_results:
+        try:
+            resp = network.get(result.url)
+            soup = BeautifulSoup(resp.content, 'html.parser')
+            
+            for anchor in soup.find_all('a', href=True):
+                href = anchor['href']
+                
+                if 'dlsite.com' in href:
+                    for match in Patterns.VNDB_SNIFF_DLSITE.finditer(href):
+                        gid = match.group(1).upper()
+                        if gid not in dlsite_seen:
+                            sniffed.dlsite_ids.append(gid)
+                            dlsite_seen.add(gid)
+                
+                elif 'dmm.co.jp' in href and '/detail/' in href:
+                    match = Patterns.VNDB_SNIFF_DMM.search(href)
+                    if match:
+                        gid = match.group(1)
+                        if gid not in fanza_seen and not Patterns.is_non_game_id(gid):
+                            sniffed.fanza_ids.append(gid)
+                            fanza_seen.add(gid)
+        
+        except Exception as e:
+            logger.warning(f"[VNDB嗅探] 解析 {result.id} 失败: {e}")
+    
+    logger.info(f"[VNDB嗅探] DLsite: {len(sniffed.dlsite_ids)}个, FANZA: {len(sniffed.fanza_ids)}个")
+    return sniffed
 
 
 # ============================================================================
@@ -1405,7 +1830,10 @@ class SearchService:
         
         # VNDB 嗅探
         if grouped.vndb:
-            self._integrate_vndb_sniffed_results(grouped)
+            self._integrate_vndb_sniffed_results(grouped, keyword)
+        
+        # 最终排序
+        grouped = ResultSorter.sort_grouped_results(keyword, grouped)
         
         # 缓存结果
         with self._cache_lock:
@@ -1414,7 +1842,8 @@ class SearchService:
         logger.info(f"搜索完成: 共 {grouped.total_count()} 个结果")
         return grouped
     
-    def _integrate_vndb_sniffed_results(self, grouped: GroupedResults) -> None:
+    def _integrate_vndb_sniffed_results(self, grouped: GroupedResults, keyword: str) -> None:
+        """整合 VNDB 嗅探结果"""
         sniffed = sniff_shop_ids_from_vndb(grouped.vndb)
         
         existing_dlsite_ids = {r.id for r in grouped.dlsite}
@@ -1841,13 +2270,10 @@ class ButterFetchApp(ttk.Window):
         self.title("🧈 ButterFetch 🧈 ")
         self.geometry(config.window_geometry)
         
-        # 图标引用先初始化
+        # 图标引用
         self._icon_16 = None
         self._icon_32 = None  
         self._icon_48 = None
-        
-        # 立即设置一次
-        self._setup_icon()
         
         # 设置全局异常处理
         GlobalExceptionHandler.setup(self)
@@ -1913,20 +2339,14 @@ class ButterFetchApp(ttk.Window):
         icon_path = resource_path("ButterFetch.ico")
         if os.path.exists(icon_path):
             try:
-                # 加载图标
                 icon_img = Image.open(icon_path)
-                
-                # 创建多个尺寸并保持引用
                 self._icon_16 = ImageTk.PhotoImage(icon_img.resize((16, 16), Image.Resampling.LANCZOS))
                 self._icon_32 = ImageTk.PhotoImage(icon_img.resize((32, 32), Image.Resampling.LANCZOS))
                 self._icon_48 = ImageTk.PhotoImage(icon_img.resize((48, 48), Image.Resampling.LANCZOS))
-                
-                # 设置图标
                 self.iconphoto(True, self._icon_48, self._icon_32, self._icon_16)
             except Exception as e:
                 logger.warning(f"图标加载失败: {e}")
 
-    
     def _build_ui(self) -> None:
         # 工具栏
         callbacks = {
@@ -1988,7 +2408,7 @@ class ButterFetchApp(ttk.Window):
         self.lbl_title = detail_comps['lbl_title']
         self.lbl_source = detail_comps['lbl_source']
         
-        # 日志视图框架（延迟构建）
+        # 日志视图框架
         self.log_frame = ttk.Labelframe(
             self.card_wrapper,
             text=" 📜 运行日志 ",
@@ -2004,14 +2424,12 @@ class ButterFetchApp(ttk.Window):
         )
     
     def _build_log_view(self) -> None:
-        """构建日志视图（懒加载）"""
+        """构建日志视图"""
         if self._log_view_built:
             return
         
-        # 顶部工具栏
         log_toolbar = ttk.Frame(self.log_frame)
         log_toolbar.pack(fill=X, pady=(0, 10))
-        
         
         ttk.Label(log_toolbar, text="级别:").pack(side=LEFT, padx=(15, 5))
         self.log_level_combo = ttk.Combobox(
@@ -2040,7 +2458,6 @@ class ButterFetchApp(ttk.Window):
             command=self._export_log
         ).pack(side=RIGHT)
         
-        # 日志文本区域
         text_frame = ttk.Frame(self.log_frame)
         text_frame.pack(fill=BOTH, expand=True)
         
@@ -2064,7 +2481,6 @@ class ButterFetchApp(ttk.Window):
         for level, color in LOG_LEVEL_COLORS.items():
             self.log_text.tag_configure(level, foreground=color)
         
-        # 底部状态栏
         bottom_frame = ttk.Frame(self.log_frame)
         bottom_frame.pack(fill=X, pady=(8, 0))
         
@@ -2109,25 +2525,20 @@ class ButterFetchApp(ttk.Window):
             self.context_menu.post(event.x_root, event.y_root)
     
     def _bind_events(self) -> None:
-        # 搜索
         self.entry.bind('<Return>', lambda e: self._request_search())
         self.entry.bind('<FocusIn>', self.event_handlers.on_entry_focus_in)
         self.entry.bind('<FocusOut>', self.event_handlers.on_entry_focus_out)
         
-        # 清除按钮
         self.btn_clear.bind("<Button-1>", lambda e: self._clear_entry())
         self.btn_clear.bind("<Enter>", self.event_handlers.on_clear_enter)
         self.btn_clear.bind("<Leave>", self.event_handlers.on_clear_leave)
         
-        # 下拉框
         self.combo.bind("<<ComboboxSelected>>", self.event_handlers.on_combo_select)
         
-        # 标题
         self.lbl_title.bind("<Enter>", self.event_handlers.on_title_enter)
         self.lbl_title.bind("<Leave>", self.event_handlers.on_title_leave)
         self.lbl_title.bind("<Button-1>", lambda e: self._copy_title())
         
-        # 窗口关闭
         self.protocol("WM_DELETE_WINDOW", self._on_close)
     
     def _register_shortcuts(self) -> None:
@@ -2138,7 +2549,6 @@ class ButterFetchApp(ttk.Window):
         self.shortcut_manager.register('<Escape>', '清空搜索框', self._clear_entry)
     
     def _on_state_change(self, old_state: SearchState, new_state: SearchState) -> None:
-        """搜索状态变更回调"""
         if new_state == SearchState.SEARCHING:
             self.btn_search.config(state="disabled")
         else:
@@ -2163,10 +2573,6 @@ class ButterFetchApp(ttk.Window):
         self.standby_image = create_placeholder_image(theme=config.theme_mode)
         if self.standby_image:
             self.img_container.config(image=self.standby_image)
-    
-    # ========================================================================
-    # 主题与置顶
-    # ========================================================================
     
     def _toggle_theme(self) -> None:
         if config.is_light:
@@ -2202,10 +2608,6 @@ class ButterFetchApp(ttk.Window):
             bootstyle="solid-info" if self.is_pinned else "outline-info"
         )
         config.save()
-    
-    # ========================================================================
-    # 日志视图
-    # ========================================================================
     
     def _toggle_log_view(self) -> None:
         self.is_log_view = not self.is_log_view
@@ -2315,10 +2717,6 @@ class ButterFetchApp(ttk.Window):
             self.after_cancel(self._log_refresh_job)
             self._log_refresh_job = None
     
-    # ========================================================================
-    # 搜索功能
-    # ========================================================================
-    
     def _request_search(self) -> None:
         if self._search_timer:
             self.after_cancel(self._search_timer)
@@ -2337,7 +2735,6 @@ class ButterFetchApp(ttk.Window):
         
         self.state_manager.state = SearchState.SEARCHING
         
-        # 更新 UI
         self.img_container.config(image='', text=UIText.LOADING)
         self.lbl_tip.config(text=UIText.SEARCHING, foreground=Colors.SKY)
         self.combo.set(UIText.SEARCHING_CAT)
@@ -2404,10 +2801,24 @@ class ButterFetchApp(ttk.Window):
         self.event_handlers.on_combo_select(None)
     
     def _format_combo_item(self, result: SearchResult) -> str:
-        prefix = f"【{result.source.value}】"
-        if result.from_vndb:
-            prefix = f"【{result.source.value}★】"
+        """格式化下拉框显示项"""
+        source_name = result.source.value
+        
+        # 构建前缀：来源 + 评分
+        if result.relevance_score > 0:
+            score_pct = int(result.relevance_score * 100)
+            if result.from_vndb:
+                prefix = f"【{source_name}★ {score_pct}%】"
+            else:
+                prefix = f"【{source_name} {score_pct}%】"
+        else:
+            if result.from_vndb:
+                prefix = f"【{source_name}★】"
+            else:
+                prefix = f"【{source_name}】"
+        
         return f"{prefix} {result.title}"
+
     
     def _build_group_buttons(self, grouped: GroupedResults) -> None:
         for widget in self.group_button_frame.winfo_children():
@@ -2479,7 +2890,6 @@ class ButterFetchApp(ttk.Window):
         
         self.img_container.config(image='', text=UIText.LOADING)
         
-        # 使用可取消的图片加载器
         self.image_loader.load(
             result,
             on_success=lambda img: self.after(0, lambda: self._update_image(img)),
@@ -2493,10 +2903,6 @@ class ButterFetchApp(ttk.Window):
     def _update_image(self, tk_img: Any) -> None:
         self.img_container.config(image=tk_img, text="")
         self.img_container.image = tk_img
-    
-    # ========================================================================
-    # 输入框处理
-    # ========================================================================
     
     def _clear_entry(self) -> None:
         self.entry.delete(0, 'end')
@@ -2527,10 +2933,6 @@ class ButterFetchApp(ttk.Window):
         if 0 <= idx < len(current_list):
             self.combo.current(idx)
             self._display_result(current_list[idx])
-    
-    # ========================================================================
-    # 操作功能
-    # ========================================================================
     
     def _open_url(self) -> None:
         if self.current_result:
@@ -2585,3 +2987,4 @@ class ButterFetchApp(ttk.Window):
 if __name__ == "__main__":
     app = ButterFetchApp()
     app.mainloop()
+
